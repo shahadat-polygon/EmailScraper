@@ -16,6 +16,10 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Configuration options
+RESPECT_ROBOTS_TXT = False  # Set to False to bypass robots.txt restrictions
+RETRY_ATTEMPTS = 3  # Number of retries for failed requests
+
 # List of user agents to rotate (if fake_useragent fails)
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
@@ -52,6 +56,10 @@ def init_driver(headless=True):
 
 # Function to check if robots.txt allows scraping
 def can_scrape(url):
+    # Always allow scraping if RESPECT_ROBOTS_TXT is False
+    if not RESPECT_ROBOTS_TXT:
+        return True
+
     try:
         parsed_url = urllib.parse.urlparse(url)
         robots_url = f"{parsed_url.scheme}://{parsed_url.netloc}/robots.txt"
@@ -82,6 +90,23 @@ def find_contact_pages(soup, base_url):
     return contact_links
 
 
+# Function to make requests with retry logic
+def make_request(session, url, headers, max_retries=RETRY_ATTEMPTS):
+    for attempt in range(max_retries):
+        try:
+            response = session.get(url, headers=headers, timeout=15)
+            response.raise_for_status()
+            return response
+        except requests.exceptions.RequestException as e:
+            if attempt == max_retries - 1:
+                logger.error(f"Failed to fetch {url} after {max_retries} attempts: {e}")
+                return None
+            wait_time = random.uniform(5, 10) * (attempt + 1)  # Exponential backoff
+            logger.warning(f"Request failed, retrying in {wait_time:.1f}s: {e}")
+            time.sleep(wait_time)
+    return None
+
+
 # Function to scrape emails using requests
 def scrape_emails_with_requests(url):
     emails = set()
@@ -98,9 +123,9 @@ def scrape_emails_with_requests(url):
         }
 
         session = requests.Session()
-        response = session.get(url, headers=headers, timeout=15)
+        response = make_request(session, url, headers)
 
-        if response.status_code == 200:
+        if response and response.status_code == 200:
             soup = BeautifulSoup(response.text, 'html.parser')
             emails.update(extract_emails_from_soup(soup))
 
@@ -111,9 +136,9 @@ def scrape_emails_with_requests(url):
                 time.sleep(random.uniform(3, 7))  # Random delay between requests
 
                 try:
-                    contact_response = session.get(contact_url, headers={'User-Agent': get_random_user_agent()},
-                                                   timeout=15)
-                    if contact_response.status_code == 200:
+                    contact_headers = {'User-Agent': get_random_user_agent()}
+                    contact_response = make_request(session, contact_url, contact_headers)
+                    if contact_response and contact_response.status_code == 200:
                         contact_soup = BeautifulSoup(contact_response.text, 'html.parser')
                         emails.update(extract_emails_from_soup(contact_soup))
                 except Exception as e:
@@ -194,6 +219,11 @@ def extract_emails_from_soup(soup):
                 if len(parts) == 2:
                     emails.add(f"{parts[0]}@{parts[1]}")
 
+    # Look for images with email in alt text or title (common hiding technique)
+    for img in soup.find_all('img', alt=True):
+        alt_text = img.get('alt', '')
+        emails.update(re.findall(email_pattern, alt_text))
+
     return emails
 
 
@@ -216,6 +246,8 @@ def scrape_emails(url):
 def main():
     input_csv = "assets/email_scrap.csv"
     output_csv = "emails_output.csv"
+
+    logger.info(f"Starting email scraper - Robots.txt respect: {RESPECT_ROBOTS_TXT}")
 
     # Read websites from CSV
     websites = []
